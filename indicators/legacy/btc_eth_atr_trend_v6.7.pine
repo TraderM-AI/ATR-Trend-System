@@ -1,0 +1,75 @@
+//@version=5
+// 원본 보존용 (v6.7). 리뷰 결과는 docs/CODE_REVIEW_v6.7.md 참고.
+indicator("BTC/ETH ATR Trend System (v6.7 Color Custom)", overlay=true)
+
+// ==========================================
+// [1] 인풋 및 변수 설정 (50배 레버리지 기준 고정)
+// ==========================================
+atrPeriod  = input.int(14, title="ATR 기간")
+multiplier = input.float(3.0, title="슈퍼트렌드 승수")
+targetRoe  = input.float(10.0, title="목표 ROE (%)")
+
+// 50배 레버리지 기준 10% 수익을 위한 가격 변동폭 (10% / 50 = 0.2%)
+priceMoveThreshold = (targetRoe / 50) / 100
+
+// ==========================================
+// [2] 슈퍼트렌드 지표 계산
+// ==========================================
+[supertrend, direction] = ta.supertrend(multiplier, atrPeriod)
+
+// direction: -1은 상승추세(그린), 1은 하락추세(레드)
+trend = direction == -1 ? 1 : -1
+trendColor = trend == 1 ? color.new(color.green, 20) : color.new(color.red, 20)
+
+// 슈퍼트렌드 트레일링 선 차트 작도
+plot(supertrend, color=trendColor, linewidth=3, title="슈퍼트렌드 추세선")
+
+// ==========================================
+// [3] 진입, 마일스톤, 종료 트래킹
+// ==========================================
+var int pos = 0
+var float entryPrice = 0.0
+var bool milestoneHit = false
+
+// 청산 및 추세 전환 조건을 진입 조건보다 '먼저' 연산 (스위칭 로직)
+longRev  = (pos == 1) and (trend == -1)
+shortRev = (pos == -1) and (trend == 1)
+
+if longRev or shortRev
+    pos := 0
+
+// 신규 진입 체크
+longCondition  = (trend == 1) and (trend[1] == -1) and (pos == 0)
+shortCondition = (trend == -1) and (trend[1] == 1) and (pos == 0)
+
+if longCondition
+    pos := 1
+    entryPrice := close
+    milestoneHit := false
+else if shortCondition
+    pos := -1
+    entryPrice := close
+    milestoneHit := false
+
+// 🔒 [+10% 돌파] 마일스톤 실시간 체크
+longMilestone  = (pos == 1) and not milestoneHit and (high >= entryPrice * (1 + priceMoveThreshold))
+shortMilestone = (pos == -1) and not milestoneHit and (low <= entryPrice * (1 - priceMoveThreshold))
+
+if longMilestone or shortMilestone
+    milestoneHit := true
+
+// ==========================================
+// [4] 시그널 화살표 및 라벨 출력 (트레이더 맞춤형 컬러 조합)
+// ==========================================
+
+// 🚀 1. 포지션 진입 시그널 (롱 = 파란색 / 숏 = 노란색)
+plotshape(series=longCondition,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, color=color.blue,   textcolor=color.blue,   size=size.normal, text="롱 진입")
+plotshape(series=shortCondition, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.yellow, textcolor=color.yellow, size=size.normal, text="숏 진입")
+
+// 🔒 2. +10% 수익 돌파 이정표 (마일스톤 = 하얀색 미니 원형)
+plotshape(series=longMilestone,  title="Long 10% Hit",  style=shape.circle, location=location.abovebar, color=color.white, textcolor=color.white, size=size.small, text="+10%")
+plotshape(series=shortMilestone, title="Short 10% Hit", style=shape.circle, location=location.belowbar, color=color.white, textcolor=color.white, size=size.small, text="+10%")
+
+// 🚩 3. 추세 전환 종료 시그널 (추세 전환 = 주황색 깃발)
+plotshape(series=longRev,        title="Long Exit",  style=shape.flag, location=location.abovebar, color=color.orange, textcolor=color.orange, size=size.small, text="추세 전환")
+plotshape(series=shortRev,       title="Short Exit", style=shape.flag, location=location.belowbar, color=color.orange, textcolor=color.orange, size=size.small, text="추세 전환")

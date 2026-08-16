@@ -1,0 +1,194 @@
+//@version=5
+// ============================================================================
+//  BTC/ETH ATR Trend System  v7.0  (Multi-Leverage)
+//  - v6.7 대비 변경점
+//    1) 레버리지 30x / 50x 선택 지원 (마일스톤 기본값: 30x=+7%, 50x=+10%)
+//    2) 수수료·슬리피지 반영한 "순수익 기준" 마일스톤 옵션
+//    3) 청산 추정가 라인 + 손절거리 > 청산거리 경고 (고배율 필수 안전장치)
+//    4) 리페인팅 방지(봉 마감 확정 시그널) 옵션
+//    5) 진입 봉 마일스톤 오탐 제거, direction=na 워밍업 구간 오작동 제거
+//    6) 알림(alertcondition) 6종, 정보 패널, 색상 커스터마이즈
+// ============================================================================
+indicator("BTC/ETH ATR Trend System (v7.0 Multi-Leverage)", overlay=true, max_labels_count=500)
+
+// ==========================================
+// [1] 인풋
+// ==========================================
+gCore = "① 핵심 설정"
+atrPeriod      = input.int(14,    "ATR 기간",                        minval=1,             group=gCore)
+multiplier     = input.float(3.0, "슈퍼트렌드 승수",                  minval=0.1, step=0.1, group=gCore)
+confirmOnClose = input.bool(true, "봉 마감 확정 후 시그널 (리페인팅 방지)",                  group=gCore)
+
+gLev = "② 레버리지 / 마일스톤"
+levMode = input.string("50x", "레버리지 선택", options=["30x", "50x"],                  group=gLev)
+roe30   = input.float(7.0,    "30배 마일스톤 ROE (%)",  minval=0.1, step=0.5,           group=gLev)
+roe50   = input.float(10.0,   "50배 마일스톤 ROE (%)",  minval=0.1, step=0.5,           group=gLev)
+
+gCost = "③ 비용 / 청산 리스크"
+useNet  = input.bool(true,     "수수료·슬리피지 반영 (순수익 기준 마일스톤)",              group=gCost)
+feePct  = input.float(0.045,   "편도 테이커 수수료 (%)", minval=0.0, step=0.005,         group=gCost)
+slipPct = input.float(0.010,   "편도 슬리피지 (%)",      minval=0.0, step=0.005,         group=gCost)
+mmrPct  = input.float(0.40,    "유지증거금률 (%)",       minval=0.0, step=0.05,          group=gCost)
+showLiq = input.bool(true,     "청산 추정가 라인 표시",                                  group=gCost)
+
+gView = "④ 표시 / 색상"
+showTable    = input.bool(true,  "정보 패널 표시",                    group=gView)
+showRoeLabel = input.bool(true,  "종료 시 ROE 라벨 표시",             group=gView)
+colUp    = input.color(color.green,  "상승 추세선",  group=gView)
+colDn    = input.color(color.red,    "하락 추세선",  group=gView)
+colLong  = input.color(color.blue,   "롱 진입",      group=gView)
+colShort = input.color(color.yellow, "숏 진입",      group=gView)
+colMile  = input.color(color.white,  "마일스톤",     group=gView)
+colExit  = input.color(color.orange, "추세 전환 종료", group=gView)
+
+// ==========================================
+// [2] 레버리지 / 임계값 계산
+// ==========================================
+lev       = levMode == "30x" ? 30.0 : 50.0
+targetRoe = levMode == "30x" ? roe30 : roe50
+
+// 왕복 거래비용을 가격 변동률로 환산 (진입 + 청산 = 편도 × 2)
+costMove = useNet ? (feePct + slipPct) * 2.0 / 100.0 : 0.0
+
+// 목표 ROE 달성에 필요한 가격 변동률 (+ 비용)
+grossMove = (targetRoe / lev) / 100.0
+reqMove   = grossMove + costMove
+
+// 비용이 갉아먹는 ROE (%) 와 청산까지의 가격 변동률
+costRoe = costMove * lev * 100.0
+liqMove = math.max(1.0 / lev - mmrPct / 100.0, 0.0)
+
+// ==========================================
+// [3] 슈퍼트렌드
+// ==========================================
+[stLine, direction] = ta.supertrend(multiplier, atrPeriod)
+
+// direction: -1 = 상승추세, 1 = 하락추세 / 워밍업(na) 구간은 0 = 판정 보류
+trend = na(direction) ? 0 : (direction == -1 ? 1 : -1)
+
+trendColor = trend == 1 ? color.new(colUp, 20) : trend == -1 ? color.new(colDn, 20) : na
+plot(trend == 0 ? na : stLine, color=trendColor, linewidth=3, style=plot.style_linebr, title="슈퍼트렌드 추세선")
+
+// ==========================================
+// [4] 포지션 / 마일스톤 상태 추적
+// ==========================================
+var int   pos          = 0
+var float entryPrice   = na
+var int   entryBar     = na
+var bool  milestoneHit = false
+
+bool  longEntry  = false
+bool  shortEntry = false
+bool  longExit   = false
+bool  shortExit  = false
+bool  longMile   = false
+bool  shortMile  = false
+float exitRoe    = na
+
+// 리페인팅 방지: 옵션 ON이면 봉이 확정된 뒤에만 상태를 갱신
+confirmed = not confirmOnClose or barstate.isconfirmed
+
+if confirmed
+    // (1) 추세 전환에 의한 종료 — 진입보다 먼저 평가 (스위칭 로직)
+    longExit  := pos ==  1 and trend == -1
+    shortExit := pos == -1 and trend ==  1
+
+    if (longExit or shortExit) and not na(entryPrice)
+        rawMove = longExit ? (close - entryPrice) / entryPrice : (entryPrice - close) / entryPrice
+        exitRoe := (rawMove - costMove) * lev * 100.0
+        if showRoeLabel
+            label.new(bar_index, longExit ? high : low,
+                 text  = "추세 전환 " + str.tostring(exitRoe, "#.#") + "%",
+                 style = longExit ? label.style_label_down : label.style_label_up,
+                 color = color.new(colExit, 20), textcolor = color.white, size = size.small)
+        pos          := 0
+        milestoneHit := false
+
+    // (2) 신규 진입
+    goLong  = trend ==  1 and trend[1] == -1 and pos == 0
+    goShort = trend == -1 and trend[1] ==  1 and pos == 0
+
+    if goLong
+        pos          := 1
+        entryPrice   := close
+        entryBar     := bar_index
+        milestoneHit := false
+        longEntry    := true
+    else if goShort
+        pos          := -1
+        entryPrice   := close
+        entryBar     := bar_index
+        milestoneHit := false
+        shortEntry   := true
+
+    // (3) 마일스톤 — 진입 봉은 제외(진입 전 고가/저가로 인한 오탐 방지)
+    if pos != 0 and not milestoneHit and not na(entryBar) and bar_index > entryBar
+        longMile  := pos ==  1 and high >= entryPrice * (1.0 + reqMove)
+        shortMile := pos == -1 and low  <= entryPrice * (1.0 - reqMove)
+        if longMile or shortMile
+            milestoneHit := true
+            // 선택된 레버리지 기준값을 그대로 표기 (30x → +7%, 50x → +10%)
+            label.new(bar_index, longMile ? high : low,
+                 text  = "+" + str.tostring(targetRoe, "#.#") + "%",
+                 style = longMile ? label.style_label_down : label.style_label_up,
+                 color = color.new(colMile, 15), textcolor = color.black, size = size.small)
+
+// ==========================================
+// [5] 청산 추정가 & 리스크 경고
+// ==========================================
+liqPrice = pos == 1 ? entryPrice * (1.0 - liqMove) : pos == -1 ? entryPrice * (1.0 + liqMove) : na
+plot(showLiq ? liqPrice : na, title="청산 추정가", color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)
+
+// 슈퍼트렌드 손절 거리(%) 가 청산 거리(%) 보다 크면 = 손절 전에 청산당하는 구간
+stopDist = pos != 0 and not na(stLine) ? math.abs(close - stLine) / close : na
+riskFlag = not na(stopDist) and stopDist > liqMove
+
+bgcolor(riskFlag ? color.new(color.red, 90) : na, title="청산 위험 구간")
+
+// ==========================================
+// [6] 시그널 출력
+// ==========================================
+plotshape(longEntry,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, color=colLong,  textcolor=colLong,  size=size.normal, text="롱 진입")
+plotshape(shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=colShort, textcolor=colShort, size=size.normal, text="숏 진입")
+
+// 마일스톤 수치는 위 label.new()가 동적으로 표기 (plotshape의 text는 상수만 가능하므로 분리)
+plotshape(longMile,   title="Long Milestone",  style=shape.circle, location=location.abovebar, color=colMile, size=size.tiny)
+plotshape(shortMile,  title="Short Milestone", style=shape.circle, location=location.belowbar, color=colMile, size=size.tiny)
+
+plotshape(longExit,   title="Long Exit",  style=shape.flag, location=location.abovebar, color=colExit, textcolor=colExit, size=size.small)
+plotshape(shortExit,  title="Short Exit", style=shape.flag, location=location.belowbar, color=colExit, textcolor=colExit, size=size.small)
+
+// ==========================================
+// [7] 정보 패널
+// ==========================================
+var table info = table.new(position.top_right, 2, 7, border_width=1, frame_width=1, frame_color=color.gray)
+
+if showTable and barstate.islast
+    hdrBg = color.new(color.gray, 70)
+    valBg = color.new(color.black, 70)
+    table.cell(info, 0, 0, "레버리지",          bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, levMode,             bgcolor=valBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 1, "마일스톤 ROE",       bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(targetRoe, "#.#") + "%" + (useNet ? " (순수익)" : " (총수익)"), bgcolor=valBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 2, "필요 가격변동",       bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(reqMove * 100.0, "#.###") + "%", bgcolor=valBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 3, "왕복 비용",          bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(costRoe, "#.#") + "% ROE", bgcolor=valBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 4, "청산까지 거리",       bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(liqMove * 100.0, "#.##") + "%", bgcolor=valBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 5, "현재 손절거리",       bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 5, na(stopDist) ? "-" : str.tostring(stopDist * 100.0, "#.##") + "%", bgcolor=valBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 6, "상태",              bgcolor=hdrBg, text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 6, riskFlag ? "⚠ 손절 전 청산 위험" : pos == 1 ? "롱 보유" : pos == -1 ? "숏 보유" : "관망",
+         bgcolor = riskFlag ? color.new(color.red, 40) : valBg, text_color=color.white, text_size=size.small)
+
+// ==========================================
+// [8] 알림
+// ==========================================
+alertcondition(longEntry,  title="롱 진입",        message="ATR Trend: 롱 진입 시그널 ({{ticker}} {{interval}})")
+alertcondition(shortEntry, title="숏 진입",        message="ATR Trend: 숏 진입 시그널 ({{ticker}} {{interval}})")
+alertcondition(longMile,   title="롱 마일스톤",     message="ATR Trend: 롱 목표 ROE 도달 ({{ticker}} {{interval}})")
+alertcondition(shortMile,  title="숏 마일스톤",     message="ATR Trend: 숏 목표 ROE 도달 ({{ticker}} {{interval}})")
+alertcondition(longExit,   title="롱 종료",        message="ATR Trend: 롱 추세 전환 종료 ({{ticker}} {{interval}})")
+alertcondition(shortExit,  title="숏 종료",        message="ATR Trend: 숏 추세 전환 종료 ({{ticker}} {{interval}})")
+alertcondition(riskFlag and not riskFlag[1], title="청산 위험 경고", message="ATR Trend: 손절거리가 청산거리를 초과했습니다 ({{ticker}} {{interval}})")
