@@ -1,166 +1,194 @@
 //@version=5
-// ============================================================================
-//  BTC/ETH ATR Trend System  v7.0  (Multi-Leverage)
-//  - v6.7 대비 변경점
-//    1) 레버리지 30x / 50x 선택 지원 (마일스톤: 30x = +7%, 50x = +10%)
-//    2) 리페인팅 방지(봉 마감 확정 시그널) 옵션
-//    3) 진입 봉 마일스톤 오탐 제거, direction = na 워밍업 구간 오작동 제거
-//    4) 종료 시그널과 진입 화살표 겹침 해소 + 종료 시 ROE 표기
-//    5) 알림(alertcondition) 6종, 정보 패널, 색상 커스터마이즈
+// ============================================================
+// BTC/ETH ATR Trend System v7
 //
-//  ※ 마일스톤은 "목표 ROE 도달"을 알리는 표식이며 청산/익절 신호가 아니다.
-//    수수료·슬리피지는 반영하지 않은 총수익(gross) 기준이다.
-// ============================================================================
-indicator("BTC/ETH ATR Trend System (v7.0 Multi-Leverage)", overlay=true, max_labels_count=500)
+// 시스템 정의 (변경 금지)
+//  1) ta.supertrend()의 direction으로 추세 판정
+//     direction == -1 → 상승/롱, direction == 1 → 하락/숏
+//  2) 추세 전환 시 기존 포지션 종료 후 즉시 반대 포지션 진입 (항상 보유)
+//  3) 포지션당 목표 ROE 마일스톤 1회 표시 (총수익/gross, 수수료 미반영)
+//  4) 슈퍼트렌드 트레일링 라인 상시 표시
+//
+// 마일스톤은 익절 신호도, 청산 신호도 아니다.
+// 알림은 기본값에서 봉 마감(barstate.isconfirmed) 기준으로 발생한다.
+// ============================================================
+indicator("BTC/ETH ATR Trend System v7", shorttitle="ATR Trend v7", overlay=true, max_labels_count=500)
 
-// ==========================================
+// ============================================================
 // [1] 인풋
-// ==========================================
-gCore = "① 핵심 설정"
-atrPeriod      = input.int(14,    "ATR 기간",                        minval=1,             group=gCore)
-multiplier     = input.float(3.0, "슈퍼트렌드 승수",                  minval=0.1, step=0.1, group=gCore)
-confirmOnClose = input.bool(true, "봉 마감 확정 후 시그널 (리페인팅 방지)",                  group=gCore)
+// ============================================================
+string GRP_ST  = "① 슈퍼트렌드"
+string GRP_LEV = "② 레버리지 / 마일스톤"
+string GRP_SIG = "③ 시그널 옵션"
+string GRP_UI  = "④ 표시"
+string GRP_COL = "⑤ 색상"
 
-gLev = "② 레버리지 / 마일스톤"
-levMode = input.string("50x", "레버리지 선택", options=["30x", "50x"],                  group=gLev)
-roe30   = input.float(7.0,    "30배 마일스톤 ROE (%)",  minval=0.1, step=0.5,           group=gLev)
-roe50   = input.float(10.0,   "50배 마일스톤 ROE (%)",  minval=0.1, step=0.5,           group=gLev)
+atrPeriod  = input.int(14, "ATR 기간", minval=1, group=GRP_ST, tooltip="슈퍼트렌드 ATR 계산 기간입니다.")
+multiplier = input.float(3.0, "슈퍼트렌드 승수", minval=0.1, step=0.1, group=GRP_ST, tooltip="값이 클수록 추세 전환이 둔감해집니다.")
 
-gView = "③ 표시 / 색상"
-showTable    = input.bool(true,  "정보 패널 표시",                     group=gView)
-showRoeLabel = input.bool(true,  "종료 시 ROE 라벨 표시 (총수익 기준)", group=gView)
-colUp    = input.color(color.green,  "상승 추세선",   group=gView)
-colDn    = input.color(color.red,    "하락 추세선",   group=gView)
-colLong  = input.color(color.blue,   "롱 진입",       group=gView)
-colShort = input.color(color.yellow, "숏 진입",       group=gView)
-colMile  = input.color(color.white,  "마일스톤",      group=gView)
-colExit  = input.color(color.orange, "추세 전환 종료", group=gView)
+levStr = input.string("50x", "레버리지", options=["30x", "50x"], group=GRP_LEV, tooltip="목표 ROE를 가격 변동폭으로 환산할 때 사용하는 레버리지입니다. 실제 주문 레버리지가 아닙니다.")
+targetRoe30 = input.float(7.0, "30배 마일스톤 ROE (%)", minval=0.1, step=0.1, group=GRP_LEV, tooltip="30x 선택 시 기본 +7% ROE. 익절이 아니라 도달 표식입니다.")
+targetRoe50 = input.float(10.0, "50배 마일스톤 ROE (%)", minval=0.1, step=0.1, group=GRP_LEV, tooltip="50x 선택 시 기본 +10% ROE. 익절이 아니라 도달 표식입니다.")
 
-// ==========================================
-// [2] 레버리지 / 마일스톤 임계값
-// ==========================================
-lev       = levMode == "30x" ? 30.0 : 50.0
-targetRoe = levMode == "30x" ? roe30 : roe50
+useConfirm = input.bool(true, "봉 마감 기준 시그널 (리페인팅 방지)", group=GRP_SIG, tooltip="ON: 확정봉에서만 진입/종료/마일스톤 상태를 갱신합니다. 과거 봉 계산은 변하지 않습니다. OFF: 진행 중 봉에서도 갱신되어 시그널이 생겼다가 사라질 수 있습니다. 알림은 ON + 트레이딩뷰 'Once Per Bar Close'를 권장합니다.")
 
-// 목표 ROE 달성에 필요한 가격 변동률 (30x: 7/30 = 0.2333% , 50x: 10/50 = 0.2000%)
-reqMove = (targetRoe / lev) / 100.0
+showStLine     = input.bool(true, "슈퍼트렌드 추세선", group=GRP_UI)
+showEntries    = input.bool(true, "진입 화살표", group=GRP_UI)
+showMilestones = input.bool(true, "마일스톤 라벨", group=GRP_UI)
+showExits      = input.bool(true, "추세 전환 깃발", group=GRP_UI)
+showPanel      = input.bool(true, "정보 패널", group=GRP_UI)
 
-// ==========================================
+colStUp     = input.color(#26A69A, "슈퍼트렌드 상승", group=GRP_COL)
+colStDn     = input.color(#EF5350, "슈퍼트렌드 하락", group=GRP_COL)
+colLongEnt  = input.color(#2196F3, "롱 진입", group=GRP_COL)
+colShortEnt = input.color(#FFB300, "숏 진입", group=GRP_COL, tooltip="순수 노랑(color.yellow)은 라이트 테마에서 잘 안 보일 수 있어 기본값을 앰버로 두었습니다.")
+colMsFill   = input.color(#00ACC1, "마일스톤 배경", group=GRP_COL, tooltip="color.white는 화이트 테마에서 캔들과 겹칩니다. 기본값은 시안입니다.")
+colMsText   = input.color(#FFFFFF, "마일스톤 글자", group=GRP_COL)
+colExit     = input.color(#FF9800, "종료 깃발 색상", group=GRP_COL)
+colPanelBg  = input.color(#131722, "패널 배경", group=GRP_COL)
+colPanelTxt = input.color(#D1D4DC, "패널 글자", group=GRP_COL)
+colPanelHd  = input.color(#00ACC1, "패널 제목", group=GRP_COL)
+
+// ============================================================
+// [2] 레버리지 환산 (하드코딩 /50 제거)
+//     필요 가격변동 = (목표ROE / 레버리지) / 100
+//     30x·7% → 0.2333%,  50x·10% → 0.2000%
+// ============================================================
+float leverage = levStr == "30x" ? 30.0 : 50.0
+float targetRoe = levStr == "30x" ? targetRoe30 : targetRoe50
+float priceMovePct = targetRoe / leverage
+float priceMoveThreshold = priceMovePct / 100.0
+string msText = "+" + str.tostring(targetRoe, "#.##") + "%"
+
+// ============================================================
 // [3] 슈퍼트렌드
-// ==========================================
-[stLine, direction] = ta.supertrend(multiplier, atrPeriod)
-
-// direction: -1 = 상승추세, 1 = 하락추세 / 워밍업(na) 구간은 0 = 판정 보류
+//     direction na(워밍업) → trend 0 (판정 보류)
+// ============================================================
+[supertrend, direction] = ta.supertrend(multiplier, atrPeriod)
 trend = na(direction) ? 0 : (direction == -1 ? 1 : -1)
 
-trendColor = trend == 1 ? color.new(colUp, 20) : trend == -1 ? color.new(colDn, 20) : na
-plot(trend == 0 ? na : stLine, color=trendColor, linewidth=3, style=plot.style_linebr, title="슈퍼트렌드 추세선")
+plot((showStLine and trend == 1)  ? supertrend : na, title="슈퍼트렌드 상승", color=colStUp, linewidth=3, style=plot.style_linebr)
+plot((showStLine and trend == -1) ? supertrend : na, title="슈퍼트렌드 하락", color=colStDn, linewidth=3, style=plot.style_linebr)
 
-// ==========================================
-// [4] 포지션 / 마일스톤 상태 추적
-// ==========================================
+// ============================================================
+// [4] 상태 머신
+//     allowUpdate가 진입/종료/마일스톤 상태 갱신을 모두 감싼다.
+//     과거 봉은 barstate.isconfirmed == true 이므로 ON이어도 재계산 결과는 동일하다.
+//
+//     종료 표식에는 ROE를 붙이지 않는다.
+//     나중에 총수익 ROE를 다시 넣을 경우 분모는 항상 진입가:
+//       롱 (px - entry) / entry , 숏 (entry - px) / entry
+//     (예전 숏식 entry/px - 1 은 청산가가 분모라 마일스톤과 불일치)
+// ============================================================
+allowUpdate = not useConfirm or barstate.isconfirmed
+
 var int   pos          = 0
 var float entryPrice   = na
 var int   entryBar     = na
 var bool  milestoneHit = false
+var int   lastMsLabelBar = -1
 
-bool  longEntry  = false
-bool  shortEntry = false
-bool  longExit   = false
-bool  shortExit  = false
-bool  longMile   = false
-bool  shortMile  = false
+longRev        = false
+shortRev       = false
+longCondition  = false
+shortCondition = false
+longMilestone  = false
+shortMilestone = false
 
-// 리페인팅 방지: 옵션 ON이면 봉이 확정된 뒤에만 상태를 갱신
-confirmed = not confirmOnClose or barstate.isconfirmed
+if allowUpdate
+    // --- 종료 (전환) : 진입보다 먼저 ---
+    longRev  := pos == 1  and trend == -1
+    shortRev := pos == -1 and trend == 1
 
-if confirmed
-    // (1) 추세 전환에 의한 종료 — 진입보다 먼저 평가 (스위칭 로직)
-    longExit  := pos ==  1 and trend == -1
-    shortExit := pos == -1 and trend ==  1
-
-    if (longExit or shortExit) and not na(entryPrice)
-        rawMove = longExit ? (close - entryPrice) / entryPrice : (entryPrice - close) / entryPrice
-        exitRoe = rawMove * lev * 100.0
-        if showRoeLabel
-            label.new(bar_index, longExit ? high : low,
-                 text  = "추세 전환 " + str.tostring(exitRoe, "#.#") + "%",
-                 style = longExit ? label.style_label_down : label.style_label_up,
-                 color = color.new(colExit, 20), textcolor = color.white, size = size.small)
-        pos          := 0
-        entryPrice   := na
-        entryBar     := na
+    if longRev
+        pos := 0
+        entryPrice := na
+        entryBar := na
+        milestoneHit := false
+    else if shortRev
+        pos := 0
+        entryPrice := na
+        entryBar := na
         milestoneHit := false
 
-    // (2) 신규 진입
-    goLong  = trend ==  1 and trend[1] == -1 and pos == 0
-    goShort = trend == -1 and trend[1] ==  1 and pos == 0
+    // --- 신규 진입 : 유효 추세끼리의 실제 전환만 ---
+    // trend 0(워밍업)에서는 진입하지 않는다. 0→±1 도 가짜 전환으로 보지 않는다.
+    longCondition  := trend == 1  and trend[1] == -1 and pos == 0
+    shortCondition := trend == -1 and trend[1] == 1  and pos == 0
 
-    if goLong
-        pos          := 1
-        entryPrice   := close
-        entryBar     := bar_index
+    if longCondition
+        pos := 1
+        entryPrice := close
+        entryBar := bar_index
         milestoneHit := false
-        longEntry    := true
-    else if goShort
-        pos          := -1
-        entryPrice   := close
-        entryBar     := bar_index
+    else if shortCondition
+        pos := -1
+        entryPrice := close
+        entryBar := bar_index
         milestoneHit := false
-        shortEntry   := true
 
-    // (3) 마일스톤 — 포지션당 1회, 진입 봉은 제외
-    //     (진입 봉의 고가/저가는 진입 이전 가격이므로 오탐 원인)
-    if pos != 0 and not milestoneHit and not na(entryBar) and bar_index > entryBar
-        longMile  := pos ==  1 and high >= entryPrice * (1.0 + reqMove)
-        shortMile := pos == -1 and low  <= entryPrice * (1.0 - reqMove)
-        if longMile or shortMile
-            milestoneHit := true
-            // 선택된 레버리지 기준값을 그대로 표기 (30x → +7%, 50x → +10%)
-            label.new(bar_index, longMile ? high : low,
-                 text  = "+" + str.tostring(targetRoe, "#.#") + "%",
-                 style = longMile ? label.style_label_down : label.style_label_up,
-                 color = color.new(colMile, 15), textcolor = color.black, size = size.small)
+    // --- 마일스톤 : 진입 봉의 이미 지나간 high/low는 사용하지 않음 ---
+    msReady = not milestoneHit and not na(entryPrice) and not na(entryBar) and bar_index > entryBar and entryPrice != 0.0
+    longMilestone  := pos == 1  and msReady and high >= entryPrice * (1.0 + priceMoveThreshold)
+    shortMilestone := pos == -1 and msReady and low  <= entryPrice * (1.0 - priceMoveThreshold)
 
-// ==========================================
-// [5] 시그널 출력
-// ==========================================
-plotshape(longEntry,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, color=colLong,  textcolor=colLong,  size=size.normal, text="롱 진입")
-plotshape(shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=colShort, textcolor=colShort, size=size.normal, text="숏 진입")
+    if longMilestone or shortMilestone
+        milestoneHit := true
 
-// 마일스톤 수치는 위 label.new()가 동적으로 표기 (plotshape의 text는 상수만 가능하므로 분리)
-plotshape(longMile,   title="Long Milestone",  style=shape.circle, location=location.abovebar, color=colMile, size=size.tiny)
-plotshape(shortMile,  title="Short Milestone", style=shape.circle, location=location.belowbar, color=colMile, size=size.tiny)
+// ============================================================
+// [5] 진입 화살표 / 추세 전환 깃발
+//     전환 봉 겹침 방지: 종료 깃발은 반대방향 진입 화살표의 반대쪽
+//       롱 종료(longRev)  → belowbar  (숏 진입은 abovebar)
+//       숏 종료(shortRev) → abovebar  (롱 진입은 belowbar)
+// ============================================================
+plotshape(showEntries and longCondition,  title="롱 진입", style=shape.triangleup,   location=location.belowbar, color=colLongEnt,  textcolor=colLongEnt,  size=size.normal, text="롱 진입")
+plotshape(showEntries and shortCondition, title="숏 진입", style=shape.triangledown, location=location.abovebar, color=colShortEnt, textcolor=colShortEnt, size=size.normal, text="숏 진입")
 
-// 종료는 라벨(ROE 포함)로 표기하고, 라벨을 끈 경우에만 깃발로 대체
-plotshape(longExit  and not showRoeLabel, title="Long Exit",  style=shape.flag, location=location.abovebar, color=colExit, size=size.small)
-plotshape(shortExit and not showRoeLabel, title="Short Exit", style=shape.flag, location=location.belowbar, color=colExit, size=size.small)
+plotshape(showExits and longRev,  title="롱 추세 전환", style=shape.flag, location=location.belowbar, color=colExit, textcolor=colExit, size=size.small, text="추세 전환")
+plotshape(showExits and shortRev, title="숏 추세 전환", style=shape.flag, location=location.abovebar, color=colExit, textcolor=colExit, size=size.small, text="추세 전환")
 
-// ==========================================
-// [6] 정보 패널
-// ==========================================
-var table info = table.new(position.top_right, 2, 5, border_width=1, frame_width=1, frame_color=color.gray)
+// ============================================================
+// [6] 마일스톤 라벨 (plotshape text는 상수만 가능하므로 label.new)
+//     전환 봉은 entryBar == bar_index 이므로 마일스톤이 차단되어
+//     숏 진입 화살표(abovebar)와 롱 마일스톤(abovebar)이 같은 봉에 겹치지 않는다.
+//     라벨 개수는 max_labels_count=500이 오래된 것부터 자동 정리한다.
+// ============================================================
+if showMilestones and (longMilestone or shortMilestone) and lastMsLabelBar != bar_index
+    lastMsLabelBar := bar_index
+    if longMilestone
+        label.new(bar_index, na, msText, xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_down, color=colMsFill, textcolor=colMsText, size=size.small, textalign=text.align_center)
+    else
+        label.new(bar_index, na, msText, xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up, color=colMsFill, textcolor=colMsText, size=size.small, textalign=text.align_center)
 
-if showTable and barstate.islast
-    hdrBg = color.new(color.gray, 70)
-    valBg = color.new(color.black, 70)
-    table.cell(info, 0, 0, "레버리지",       bgcolor=hdrBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 0, levMode,          bgcolor=valBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 0, 1, "마일스톤 ROE",    bgcolor=hdrBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 1, "+" + str.tostring(targetRoe, "#.#") + "%", bgcolor=valBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 0, 2, "필요 가격변동",    bgcolor=hdrBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 2, str.tostring(reqMove * 100.0, "#.###") + "%", bgcolor=valBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 0, 3, "현재 포지션",      bgcolor=hdrBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 3, pos == 1 ? "롱 보유" : pos == -1 ? "숏 보유" : "관망", bgcolor=valBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 0, 4, "마일스톤",        bgcolor=hdrBg, text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 4, pos == 0 ? "-" : milestoneHit ? "도달" : "미도달", bgcolor=valBg, text_color=color.white, text_size=size.small)
+// ============================================================
+// [7] 정보 패널
+// ============================================================
+var table panel = table.new(position.top_right, 2, 6, bgcolor=color.new(colPanelBg, 10), border_width=1, border_color=color.new(#787B86, 40), frame_color=colPanelHd, frame_width=1)
 
-// ==========================================
-// [7] 알림
-// ==========================================
-alertcondition(longEntry,  title="롱 진입",     message="ATR Trend: 롱 진입 시그널 ({{ticker}} {{interval}})")
-alertcondition(shortEntry, title="숏 진입",     message="ATR Trend: 숏 진입 시그널 ({{ticker}} {{interval}})")
-alertcondition(longMile,   title="롱 마일스톤",  message="ATR Trend: 롱 목표 ROE 도달 ({{ticker}} {{interval}})")
-alertcondition(shortMile,  title="숏 마일스톤",  message="ATR Trend: 숏 목표 ROE 도달 ({{ticker}} {{interval}})")
-alertcondition(longExit,   title="롱 종료",     message="ATR Trend: 롱 추세 전환 종료 ({{ticker}} {{interval}})")
-alertcondition(shortExit,  title="숏 종료",     message="ATR Trend: 숏 추세 전환 종료 ({{ticker}} {{interval}})")
+if showPanel and barstate.islast
+    posTxt = pos == 1 ? "롱" : pos == -1 ? "숏" : (trend == 0 ? "워밍업" : "대기")
+    posCol = pos == 1 ? colStUp : pos == -1 ? colStDn : colPanelTxt
+    msPanel = pos == 0 ? "-" : milestoneHit ? "도달" : "대기중"
+    msCol = pos == 0 ? colPanelTxt : milestoneHit ? colStUp : colPanelTxt
+    table.cell(panel, 0, 0, "ATR Trend v7", text_color=colPanelHd, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 0, useConfirm ? "봉마감" : "실시간", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_right)
+    table.cell(panel, 0, 1, "레버리지", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 1, levStr, text_color=colPanelTxt, text_size=size.small, text_halign=text.align_right)
+    table.cell(panel, 0, 2, "마일스톤 ROE", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 2, str.tostring(targetRoe, "#.##") + "%", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_right)
+    table.cell(panel, 0, 3, "필요 가격변동", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 3, str.tostring(priceMovePct, "#.####") + "%", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_right)
+    table.cell(panel, 0, 4, "현재 포지션", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 4, posTxt, text_color=posCol, text_size=size.small, text_halign=text.align_right)
+    table.cell(panel, 0, 5, "마일스톤", text_color=colPanelTxt, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 5, msPanel, text_color=msCol, text_size=size.small, text_halign=text.align_right)
+
+// ============================================================
+// [8] 알림 (봉 마감 기준 — useConfirm 기본 ON)
+// ============================================================
+alertcondition(longCondition,  title="롱 진입",      message="ATR Trend v7: 롱 진입 (봉 마감 기준 확정 시그널)")
+alertcondition(shortCondition, title="숏 진입",      message="ATR Trend v7: 숏 진입 (봉 마감 기준 확정 시그널)")
+alertcondition(longMilestone,  title="롱 마일스톤",  message="ATR Trend v7: 롱 목표 ROE 마일스톤 도달 (봉 마감 기준, 익절 아님)")
+alertcondition(shortMilestone, title="숏 마일스톤",  message="ATR Trend v7: 숏 목표 ROE 마일스톤 도달 (봉 마감 기준, 익절 아님)")
+alertcondition(longRev,        title="롱 추세 전환", message="ATR Trend v7: 추세 전환 (봉 마감 기준)")
+alertcondition(shortRev,       title="숏 추세 전환", message="ATR Trend v7: 추세 전환 (봉 마감 기준)")
